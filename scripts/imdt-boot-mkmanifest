@@ -34,8 +34,7 @@ def main():
         sys.exit(f"imdt-boot-mkmanifest: no slot a images in {args.partitions}")
 
     os.makedirs(os.path.join(args.out, "images"), exist_ok=True)
-    lines = ["# imdt-boot manifest", f"# version {args.version}",
-             "# partition image size sha256"]
+    body = []
     for base, name in sorted(entries.items()):
         src = next((os.path.join(d, name) for d in args.search
                     if os.path.isfile(os.path.join(d, name))), None)
@@ -43,9 +42,13 @@ def main():
             sys.exit(f"imdt-boot-mkmanifest: {name} for {base}_a not found")
         with open(src, "rb") as f:
             data = f.read()
-        lines.append(f"{base} {name} {len(data)} {hashlib.sha256(data).hexdigest()}")
+        body.append(f"{base} {name} {len(data)} {hashlib.sha256(data).hexdigest()}")
         dst = os.path.join(args.out, "images", name + ".zst")
         subprocess.run(["zstd", "-q", "-f", "-19", "-T0", src, "-o", dst], check=True)
+    # The id changes exactly when an image does, whatever --version says.
+    fw_id = hashlib.sha256("\n".join(body).encode()).hexdigest()[:12]
+    lines = ["# imdt-boot manifest", f"# version {args.version} ({fw_id})",
+             "# partition image size sha256"] + body
     with open(os.path.join(args.out, "manifest"), "w") as f:
         f.write("\n".join(lines) + "\n")
 
