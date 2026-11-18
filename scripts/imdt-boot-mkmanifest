@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Build the imdt-boot manifest and images from the rawprogram XMLs.
+
+Every partition the XMLs write to slot a gets an entry: its base name, the
+image file, size and sha256. The images are stored zstd compressed. Files are
+looked up in the search directories in order, as the qcomflash bundle does.
+"""
+
+import argparse
+import glob
+import hashlib
+import os
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--partitions", required=True, help="directory with rawprogram*.xml")
+    ap.add_argument("--search", required=True, action="append", help="image search directory")
+    ap.add_argument("--version", required=True, help="firmware version string")
+    ap.add_argument("--out", required=True, help="output directory")
+    args = ap.parse_args()
+
+    entries = {}
+    for xml in sorted(glob.glob(os.path.join(args.partitions, "rawprogram*.xml"))):
+        for prog in ET.parse(xml).getroot().iter("program"):
+            label, name = prog.get("label", ""), prog.get("filename", "")
+            if label.endswith("_a") and name:
+                entries[label[:-2]] = name
+    if not entries:
+        sys.exit(f"imdt-boot-mkmanifest: no slot a images in {args.partitions}")
+
+    os.makedirs(os.path.join(args.out, "images"), exist_ok=True)
+    lines = ["# imdt-boot manifest", f"# version {args.version}",
+             "# partition image size sha256"]
+    for base, name in sorted(entries.items()):
+        src = next((os.path.join(d, name) for d in args.search
+                    if os.path.isfile(os.path.join(d, name))), None)
+        if src is None:
+            sys.exit(f"imdt-boot-mkmanifest: {name} for {base}_a not found")
+        with open(src, "rb") as f:
+            data = f.read()
+        lines.append(f"{base} {name} {len(data)} {hashlib.sha256(data).hexdigest()}")
+        dst = os.path.join(args.out, "images", name + ".zst")
+        subprocess.run(["zstd", "-q", "-f", "-19", "-T0", src, "-o", dst], check=True)
+    with open(os.path.join(args.out, "manifest"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+if __name__ == "__main__":
+    main()

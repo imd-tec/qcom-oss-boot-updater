@@ -1,0 +1,21 @@
+[package]
+name = "qcom-oss-boot-updater"
+version = "0.1.0"
+edition = "2021"
+description = "Check and update the A/B boot firmware against an OSTree deployment's manifest"
+license = "MIT"
+repository = "https://github.com/imd-tec/qcom-oss-boot-updater"
+
+[[bin]]
+name = "imdt-boot"
+path = "src/main.rs"
+
+[dependencies]
+crc32fast = "1"
+ruzstd = "0.8"
+sha2 = "0.10"
+
+[profile.release]
+lto = true
+opt-level = "s"
+strip = true
