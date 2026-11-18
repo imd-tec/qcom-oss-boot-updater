@@ -13,6 +13,7 @@ import hashlib
 import os
 import subprocess
 import sys
+import tarfile
 import xml.etree.ElementTree as ET
 
 
@@ -22,6 +23,7 @@ def main():
     ap.add_argument("--search", required=True, action="append", help="image search directory")
     ap.add_argument("--version", required=True, help="firmware version string")
     ap.add_argument("--out", required=True, help="output directory")
+    ap.add_argument("--bundle", help="also write the manifest and images as one tar.zst here")
     args = ap.parse_args()
 
     entries = {}
@@ -35,6 +37,7 @@ def main():
 
     os.makedirs(os.path.join(args.out, "images"), exist_ok=True)
     body = []
+    sources = []
     for base, name in sorted(entries.items()):
         src = next((os.path.join(d, name) for d in args.search
                     if os.path.isfile(os.path.join(d, name))), None)
@@ -43,14 +46,32 @@ def main():
         with open(src, "rb") as f:
             data = f.read()
         body.append(f"{base} {name} {len(data)} {hashlib.sha256(data).hexdigest()}")
+        sources.append((name, src))
         dst = os.path.join(args.out, "images", name + ".zst")
         subprocess.run(["zstd", "-q", "-f", "-19", "-T0", src, "-o", dst], check=True)
     # The id changes exactly when an image does, whatever --version says.
     fw_id = hashlib.sha256("\n".join(body).encode()).hexdigest()[:12]
     lines = ["# imdt-boot manifest", f"# version {args.version} ({fw_id})",
              "# partition image size sha256"] + body
-    with open(os.path.join(args.out, "manifest"), "w") as f:
+    manifest = os.path.join(args.out, "manifest")
+    with open(manifest, "w") as f:
         f.write("\n".join(lines) + "\n")
+
+    # imdt-boot streams the bundle, so the manifest has to come first.
+    if args.bundle:
+        zstd = subprocess.Popen(["zstd", "-q", "-f", "-19", "-T0", "-o", args.bundle],
+                                stdin=subprocess.PIPE)
+        with tarfile.open(fileobj=zstd.stdin, mode="w|", format=tarfile.USTAR_FORMAT) as tar:
+            for arcname, path in [("manifest", manifest)] + sorted(set(sources)):
+                info = tar.gettarinfo(path, arcname)
+                info.uid = info.gid = 0
+                info.uname = info.gname = ""
+                info.mtime = 0
+                with open(path, "rb") as f:
+                    tar.addfile(info, f)
+        zstd.stdin.close()
+        if zstd.wait() != 0:
+            sys.exit("imdt-boot-mkmanifest: zstd failed")
 
 
 if __name__ == "__main__":
