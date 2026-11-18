@@ -48,7 +48,7 @@ manifest, or nothing is written. `--images` also takes a directory of
 
 Once the board is up on the new slot, `imdt-boot switch --yes` goes back to
 the old firmware, which stays on the other slot. The first boot after a
-switch resets once more before it comes up.
+switch can reset once more before it comes up.
 
 ## How the slots work
 
@@ -61,7 +61,10 @@ This follows the Qualcomm UFS A/B scheme:
   `77036cd4-03d5-42bb-8ed1-37e5a88baa34`.
 
 A switch swaps the type GUIDs of each pair, in both the backup and the
-primary GPT, then sets `bBootLunEn` with `ufs-utils`.
+primary GPT, then sets `bBootLunEn` with `ufs-utils`. The tables are parsed
+and serialised by [gptman](https://crates.io/crates/gptman). Both copies must
+pass their CRC checks and agree before anything is written, and they are
+written backup first, each synced, so a torn write leaves a valid primary.
 
 An update writes each image to the other slot and reads it back to check
 its sha256. Pairs without an image, such as `qweslicstore`, are copied from
