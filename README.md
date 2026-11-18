@@ -6,10 +6,10 @@ OSTree image it runs.
 
 The boot firmware (xbl, tz, hyp, uefi, NON-HLOS, ...) lives on raw
 partitions outside the OSTree rootfs, so an OSTree update does not change it.
-Each image ships a manifest of the firmware it was built with, and the images
-themselves, under `/usr/lib/imdt-boot/`. `imdt-boot` compares the board
-against that manifest and can write the firmware to the slot that is not
-running, then switch to it.
+Each image ships a manifest of the firmware it was built with under
+`/usr/lib/imdt-boot/`, and usually the images themselves too. `imdt-boot`
+compares the board against that manifest and can write the firmware to the
+slot that is not running, then switch to it.
 
 ## Commands
 
@@ -17,7 +17,7 @@ running, then switch to it.
 imdt-boot status [--pending | --root DIR]   booted slot and which partitions match
 imdt-boot check  [--pending | --root DIR] [--warn-only]
                                             warn when the booted slot differs
-imdt-boot update [--pending | --root DIR] --yes
+imdt-boot update [--pending | --root DIR] [--images BUNDLE] --yes
                                             write the other slot and switch to it
 imdt-boot switch --yes                      boot the other slot next time, or
                                             cancel a pending switch
@@ -33,6 +33,18 @@ imdt-boot check --pending
 imdt-boot update --pending --yes
 reboot
 ```
+
+An image built without the firmware images carries only the manifest. Then
+pass the firmware bundle the build deploys, `imdt-boot-<machine>.tar.zst`:
+
+```
+imdt-boot update --pending --images imdt-boot-imdt-8550-sbc.tar.zst --yes
+```
+
+The bundle is streamed straight onto the partitions, so the board needs no
+room to unpack it. It must hold the same firmware as the deployment's
+manifest, or nothing is written. `--images` also takes a directory of
+`<image>.zst` files.
 
 Once the board is up on the new slot, `imdt-boot switch --yes` goes back to
 the old firmware, which stays on the other slot. The first boot after a
@@ -62,7 +74,9 @@ board needs a QDL flash.
 ## Manifest
 
 `scripts/imdt-boot-mkmanifest` builds the manifest and the zstd-compressed
-images from the `rawprogram*.xml` files of a qcomflash bundle:
+images from the `rawprogram*.xml` files of a qcomflash bundle. With
+`--bundle` it also writes the firmware bundle, a ustar archive of the
+manifest followed by the raw images, compressed as one zstd stream.
 
 ```
 # imdt-boot manifest

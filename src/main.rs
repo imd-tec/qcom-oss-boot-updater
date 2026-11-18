@@ -30,13 +30,15 @@ const USAGE: &str = "usage: imdt-boot <command> [options]
   status [--pending | --root DIR]   slot in use and which partitions match
   check  [--pending | --root DIR] [--warn-only]
                                     warn when the booted slot differs
-  update [--pending | --root DIR] --yes
+  update [--pending | --root DIR] [--images BUNDLE] --yes
                                     write the other slot and switch to it
   switch --yes                      boot the other slot next time, or
                                     cancel a pending switch
   record                            save the booted slot, run at boot
 
---pending uses the deployment ostree boots next, after ostree-imdt-update.";
+--pending uses the deployment ostree boots next, after ostree-imdt-update.
+--images takes the firmware bundle, imdt-boot-<machine>.tar.zst, when the
+image does not carry the firmware images, or a directory of <image>.zst.";
 
 type Res<T> = Result<T, String>;
 
@@ -46,6 +48,7 @@ fn ctx<T, E: std::fmt::Display>(r: Result<T, E>, what: impl std::fmt::Display) -
 
 // --- manifest -------------------------------------------------------------
 
+#[derive(PartialEq)]
 struct Entry {
     base: String,
     image: String,
@@ -64,6 +67,10 @@ impl Manifest {
         let dir = root.join(BOOT_DIR);
         let path = dir.join("manifest");
         let text = ctx(fs::read_to_string(&path), path.display())?;
+        Manifest::parse(dir, &text, &path.display().to_string())
+    }
+
+    fn parse(dir: PathBuf, text: &str, what: &str) -> Res<Manifest> {
         let mut m = Manifest { dir, version: "unknown".into(), entries: Vec::new() };
         for line in text.lines().map(str::trim) {
             if let Some(v) = line.strip_prefix("# version ") {
@@ -74,9 +81,9 @@ impl Manifest {
             }
             let f: Vec<&str> = line.split_whitespace().collect();
             let [base, image, size, sha] = f[..] else {
-                return Err(format!("{}: bad line '{line}'", path.display()));
+                return Err(format!("{what}: bad line '{line}'"));
             };
-            let size = ctx(size.parse(), format!("{}: size", path.display()))?;
+            let size = ctx(size.parse(), format!("{what}: size"))?;
             m.entries.push(Entry { base: base.into(), image: image.into(), size, sha: sha.into() });
         }
         Ok(m)
@@ -268,14 +275,13 @@ fn sha256_dev(dev: &Path, size: u64) -> Res<String> {
     Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
-fn write_image(src: &Path, dev: &Path, size: u64) -> Res<()> {
-    let f = ctx(File::open(src), src.display())?;
-    let mut dec = ctx(ruzstd::decoding::StreamingDecoder::new(f), src.display())?;
+/// Writes everything `src` yields to `dev`, which must be `size` bytes.
+fn write_from(src: &mut dyn Read, what: &str, dev: &Path, size: u64) -> Res<()> {
     let mut out = ctx(OpenOptions::new().write(true).open(dev), dev.display())?;
     let mut buf = vec![0u8; CHUNK];
     let mut done = 0u64;
     loop {
-        let n = ctx(dec.read(&mut buf), src.display())?;
+        let n = ctx(src.read(&mut buf), what)?;
         if n == 0 {
             break;
         }
@@ -284,8 +290,37 @@ fn write_image(src: &Path, dev: &Path, size: u64) -> Res<()> {
     }
     ctx(out.sync_all(), dev.display())?;
     if done != size {
-        return Err(format!("{}: {done} bytes, the manifest says {size}", src.display()));
+        return Err(format!("{what}: {done} bytes, the manifest says {size}"));
     }
+    Ok(())
+}
+
+fn zstd_reader(path: &Path) -> Res<impl Read> {
+    let f = ctx(File::open(path), path.display())?;
+    ctx(ruzstd::decoding::StreamingDecoder::new(f), path.display())
+}
+
+/// The next member of a ustar stream, as its name and size, or None at the end.
+fn tar_next(r: &mut dyn Read, what: &str) -> Res<Option<(String, u64)>> {
+    let mut h = [0u8; 512];
+    ctx(r.read_exact(&mut h), what)?;
+    if h.iter().all(|&b| b == 0) {
+        return Ok(None);
+    }
+    let field = |a: usize, b: usize| String::from_utf8_lossy(&h[a..b]).trim_end_matches('\0').to_string();
+    let size = ctx(u64::from_str_radix(field(124, 136).trim(), 8), format!("{what}: tar size"))?;
+    let name = field(0, 100);
+    let name = name.strip_prefix("./").unwrap_or(&name).to_string();
+    if h[156] != b'0' && h[156] != 0 {
+        return Err(format!("{what}: {name} is not a regular file"));
+    }
+    Ok(Some((name, size)))
+}
+
+/// Skips the rest of a member and its padding to the next 512-byte block.
+fn tar_skip(r: &mut dyn Read, left: u64, size: u64, what: &str) -> Res<()> {
+    let pad = (512 - size % 512) % 512;
+    ctx(std::io::copy(&mut r.take(left + pad), &mut std::io::sink()), what)?;
     Ok(())
 }
 
@@ -319,6 +354,7 @@ struct Opts {
     root: Option<PathBuf>,
     yes: bool,
     warn_only: bool,
+    images: Option<PathBuf>,
 }
 
 fn status(o: &Opts) -> Res<i32> {
@@ -352,6 +388,47 @@ fn check(o: &Opts) -> Res<i32> {
     Ok(if o.warn_only { 0 } else { 1 })
 }
 
+/// Streams a manifest-first tar.zst bundle straight onto the partitions in `todo`.
+fn write_bundle(
+    m: &Manifest,
+    path: &Path,
+    todo: &[(&Entry, String, Part)],
+    verify: &dyn Fn(&Entry, &str, &Part) -> Res<()>,
+) -> Res<()> {
+    let what = path.display().to_string();
+    let mut r = zstd_reader(path)?;
+    let text = match tar_next(&mut r, &what)? {
+        Some((name, size)) if name == "manifest" => {
+            let mut t = String::new();
+            ctx((&mut r).take(size).read_to_string(&mut t), &what)?;
+            tar_skip(&mut r, 0, size, &what)?;
+            t
+        }
+        _ => return Err(format!("{what}: does not start with a manifest")),
+    };
+    let theirs = Manifest::parse(PathBuf::new(), &text, &what)?;
+    if theirs.entries != m.entries {
+        return Err(format!("{what} holds {}, this deployment needs {}", theirs.version, m.version));
+    }
+    let mut done = 0;
+    while let Some((name, size)) = tar_next(&mut r, &what)? {
+        match todo.iter().find(|(e, _, _)| e.image == name) {
+            Some((e, label, p)) => {
+                println!("  {label}: writing {name}");
+                write_from(&mut (&mut r).take(size), &format!("{what}: {name}"), &p.dev, e.size)?;
+                tar_skip(&mut r, 0, size, &what)?;
+                verify(e, label, p)?;
+                done += 1;
+            }
+            None => tar_skip(&mut r, size, size, &what)?,
+        }
+    }
+    if done != todo.len() {
+        return Err(format!("{what}: {} of {} images missing", todo.len() - done, todo.len()));
+    }
+    Ok(())
+}
+
 fn update(o: &Opts) -> Res<i32> {
     let m = Manifest::load(&deployment_root(o)?)?;
     let slot = record_booted()?;
@@ -364,6 +441,7 @@ fn update(o: &Opts) -> Res<i32> {
     if !o.yes {
         return Err("this rewrites the boot firmware, pass --yes to go ahead".into());
     }
+    let mut todo = Vec::new();
     for e in &m.entries {
         let label = format!("{}_{target}", e.base);
         let p = match part(&label)? {
@@ -372,12 +450,29 @@ fn update(o: &Opts) -> Res<i32> {
         };
         if sha256_dev(&p.dev, e.size)? == e.sha {
             println!("  {label}: already {}", e.image);
-            continue;
+        } else {
+            todo.push((e, label, p));
         }
-        println!("  {label}: writing {}", e.image);
-        write_image(&m.dir.join("images").join(format!("{}.zst", e.image)), &p.dev, e.size)?;
+    }
+    let verify = |e: &Entry, label: &str, p: &Part| -> Res<()> {
         if sha256_dev(&p.dev, e.size)? != e.sha {
             return Err(format!("{label}: verify failed, slot {slot} is still the boot slot"));
+        }
+        Ok(())
+    };
+    match &o.images {
+        Some(b) if b.is_file() => write_bundle(&m, b, &todo, &verify)?,
+        dir => {
+            let dir = dir.clone().unwrap_or_else(|| m.dir.join("images"));
+            for (e, label, p) in &todo {
+                let src = dir.join(format!("{}.zst", e.image));
+                if !src.exists() {
+                    return Err(format!("{} is missing, pass the firmware bundle with --images", src.display()));
+                }
+                println!("  {label}: writing {}", e.image);
+                write_from(&mut zstd_reader(&src)?, &src.display().to_string(), &p.dev, e.size)?;
+                verify(e, label, p)?;
+            }
         }
     }
     // Partitions without an image (licences, DRM data) follow the booted slot.
@@ -432,6 +527,7 @@ fn main() {
         match a.as_str() {
             "--pending" => o.pending = true,
             "--root" => o.root = it.next().map(PathBuf::from),
+            "--images" => o.images = it.next().map(PathBuf::from),
             "--yes" => o.yes = true,
             "--warn-only" => o.warn_only = true,
             "-h" | "--help" => {
