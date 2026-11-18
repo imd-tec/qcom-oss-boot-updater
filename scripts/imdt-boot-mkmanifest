@@ -19,15 +19,16 @@ import xml.etree.ElementTree as ET
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--partitions", required=True, help="directory with rawprogram*.xml")
+    ap.add_argument("--partitions", required=True, help="directory with rawprogram[0-9].xml")
     ap.add_argument("--search", required=True, action="append", help="image search directory")
     ap.add_argument("--version", required=True, help="firmware version string")
     ap.add_argument("--out", required=True, help="output directory")
     ap.add_argument("--bundle", help="also write the manifest and images as one tar.zst here")
     args = ap.parse_args()
 
+    # Only the XMLs qcomflash flashes, not the rawprogramN_WIPE_PARTITIONS.xml next to them.
     entries = {}
-    for xml in sorted(glob.glob(os.path.join(args.partitions, "rawprogram*.xml"))):
+    for xml in sorted(glob.glob(os.path.join(args.partitions, "rawprogram[0-9].xml"))):
         for prog in ET.parse(xml).getroot().iter("program"):
             label, name = prog.get("label", ""), prog.get("filename", "")
             if label.endswith("_a") and name:
