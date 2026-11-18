@@ -1,48 +1,29 @@
-//! Just enough GPT to read and swap partition type GUIDs on one UFS LUN.
+//! The GPT of one UFS LUN, enough to read and swap partition type GUIDs.
+//!
+//! gptman parses and serialises the tables. Its GPT::write_into writes the
+//! primary copy first and assumes where the backup entries sit, so both copies
+//! are written here from their own on-disk headers, backup first, each synced,
+//! so a torn write leaves a valid primary for the loaders.
 
+use gptman::{GPTHeader, GPTPartitionEntry};
 use std::fs::{File, OpenOptions};
-use std::io::{Error, ErrorKind, Result};
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::io::{Error, ErrorKind, Result, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-
-const O_SYNC: i32 = 0o4010000;
-
-struct Header {
-    raw: Vec<u8>,
-    lba: u64,
-    entries_lba: u64,
-}
 
 pub struct Gpt {
     path: PathBuf,
     sector: u64,
-    entries: Vec<u8>,
-    entry_size: usize,
-    primary: Header,
-    backup: Header,
+    primary: GPTHeader,
+    backup: GPTHeader,
+    entries: Vec<GPTPartitionEntry>,
 }
 
-fn bad(path: &Path, what: &str) -> Error {
-    Error::new(ErrorKind::InvalidData, format!("{}: {}", path.display(), what))
-}
-
-fn u32_at(b: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes(b[off..off + 4].try_into().unwrap())
-}
-
-fn u64_at(b: &[u8], off: usize) -> u64 {
-    u64::from_le_bytes(b[off..off + 8].try_into().unwrap())
-}
-
-fn header_crc(raw: &[u8]) -> u32 {
-    let size = u32_at(raw, 12) as usize;
-    let mut h = raw[..size].to_vec();
-    h[16..20].fill(0);
-    crc32fast::hash(&h)
+fn bad(path: &Path, what: impl std::fmt::Display) -> Error {
+    Error::new(ErrorKind::InvalidData, format!("{}: {what}", path.display()))
 }
 
 /// Turns the on-disk mixed-endian GUID into its usual text form.
-pub fn guid_text(b: &[u8]) -> String {
+pub fn guid_text(b: &[u8; 16]) -> String {
     format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{}",
         b[3], b[2], b[1], b[0], b[5], b[4], b[7], b[6], b[8], b[9],
@@ -50,82 +31,56 @@ pub fn guid_text(b: &[u8]) -> String {
     )
 }
 
+/// Reads one header at `lba` and its entries, both CRC checked by gptman.
+fn read_copy(f: &mut File, path: &Path, sector: u64, lba: u64) -> Result<(GPTHeader, Vec<GPTPartitionEntry>)> {
+    f.seek(SeekFrom::Start(lba * sector))?;
+    let header = GPTHeader::read_from(f).map_err(|e| bad(path, format!("GPT header at LBA {lba}: {e}")))?;
+    let entries = header
+        .read_partitions(f, sector)
+        .map_err(|e| bad(path, format!("GPT entries of LBA {lba}: {e}")))?;
+    Ok((header, entries))
+}
+
 impl Gpt {
+    /// Reads both copies and insists they agree, rather than trusting either one alone.
     pub fn open(path: &Path, sector: u64) -> Result<Gpt> {
-        let f = File::open(path)?;
-        let (primary, entries, entry_size) = Self::read(&f, path, sector, 1)?;
-        let backup_lba = u64_at(&primary.raw, 32);
-        let (backup, backup_entries, _) = Self::read(&f, path, sector, backup_lba)?;
+        let mut f = File::open(path)?;
+        let (primary, entries) = read_copy(&mut f, path, sector, 1)?;
+        let (backup, backup_entries) = read_copy(&mut f, path, sector, primary.backup_lba)?;
         if entries != backup_entries {
             return Err(bad(path, "primary and backup GPT entries differ"));
         }
-        Ok(Gpt { path: path.to_path_buf(), sector, entries, entry_size, primary, backup })
-    }
-
-    fn read(f: &File, path: &Path, sector: u64, lba: u64) -> Result<(Header, Vec<u8>, usize)> {
-        let mut raw = vec![0u8; sector as usize];
-        f.read_exact_at(&mut raw, lba * sector)?;
-        if &raw[..8] != b"EFI PART" {
-            return Err(bad(path, &format!("no GPT header at LBA {lba}")));
-        }
-        if header_crc(&raw) != u32_at(&raw, 16) {
-            return Err(bad(path, &format!("bad GPT header CRC at LBA {lba}")));
-        }
-        let entries_lba = u64_at(&raw, 72);
-        let count = u32_at(&raw, 80) as usize;
-        let entry_size = u32_at(&raw, 84) as usize;
-        let mut entries = vec![0u8; count * entry_size];
-        f.read_exact_at(&mut entries, entries_lba * sector)?;
-        if crc32fast::hash(&entries) != u32_at(&raw, 88) {
-            return Err(bad(path, &format!("bad GPT entries CRC at LBA {lba}")));
-        }
-        Ok((Header { raw, lba, entries_lba }, entries, entry_size))
-    }
-
-    fn entry(&self, num: u32) -> &[u8] {
-        let off = (num as usize - 1) * self.entry_size;
-        &self.entries[off..off + self.entry_size]
+        Ok(Gpt { path: path.to_path_buf(), sector, primary, backup, entries })
     }
 
     pub fn type_guid(&self, num: u32) -> String {
-        guid_text(&self.entry(num)[..16])
+        guid_text(&self.entries[num as usize - 1].partition_type_guid)
     }
 
     /// Partition names and numbers, for finding the A/B pairs.
     #[cfg(test)]
     pub fn names(&self) -> Vec<(String, u32)> {
-        let mut out = Vec::new();
-        for (i, e) in self.entries.chunks(self.entry_size).enumerate() {
-            if e[..16].iter().all(|&b| b == 0) {
-                continue;
-            }
-            let utf16: Vec<u16> = e[56..128]
-                .chunks(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .take_while(|&c| c != 0)
-                .collect();
-            out.push((String::from_utf16_lossy(&utf16), i as u32 + 1));
-        }
-        out
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.is_used())
+            .map(|(i, e)| (e.partition_name.as_str().to_string(), i as u32 + 1))
+            .collect()
     }
 
     pub fn swap(&mut self, a: u32, b: u32) {
-        let (oa, ob) = ((a as usize - 1) * self.entry_size, (b as usize - 1) * self.entry_size);
-        for i in 0..16 {
-            self.entries.swap(oa + i, ob + i);
-        }
+        let (a, b) = (a as usize - 1, b as usize - 1);
+        let t = self.entries[a].partition_type_guid;
+        self.entries[a].partition_type_guid = self.entries[b].partition_type_guid;
+        self.entries[b].partition_type_guid = t;
     }
 
-    /// Writes the backup GPT, then the primary, so a torn write leaves one valid copy.
+    /// Writes the backup copy, then the primary, so a torn write leaves one valid copy.
     pub fn write(&mut self) -> Result<()> {
-        let f = OpenOptions::new().read(true).write(true).custom_flags(O_SYNC).open(&self.path)?;
-        let crc = crc32fast::hash(&self.entries);
+        let mut f = OpenOptions::new().read(true).write(true).open(&self.path)?;
         for h in [&mut self.backup, &mut self.primary] {
-            h.raw[88..92].copy_from_slice(&crc.to_le_bytes());
-            let hcrc = header_crc(&h.raw);
-            h.raw[16..20].copy_from_slice(&hcrc.to_le_bytes());
-            f.write_all_at(&self.entries, h.entries_lba * self.sector)?;
-            f.write_all_at(&h.raw, h.lba * self.sector)?;
+            h.write_into(&mut f, self.sector, &self.entries)
+                .map_err(|e| bad(&self.path, format!("writing the GPT at LBA {}: {e}", h.primary_lba)))?;
             f.sync_all()?;
         }
         Ok(())
@@ -135,6 +90,7 @@ impl Gpt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::FileExt;
 
     /// Swaps every A/B pair of a GPT image and back, set IMDT_BOOT_GPT_IMAGE to run.
     #[test]
@@ -164,10 +120,10 @@ mod tests {
         let len = std::fs::metadata(&img).unwrap().len();
         let (orig, back) = (File::open(&img).unwrap(), File::open(&work).unwrap());
         for off in [0, len - 5 * 4096] {
-            let (mut x, mut y) = (vec![0u8; 6 * 4096], vec![0u8; 6 * 4096]);
             let n = (len - off).min(6 * 4096) as usize;
-            orig.read_exact_at(&mut x[..n], off).unwrap();
-            back.read_exact_at(&mut y[..n], off).unwrap();
+            let (mut x, mut y) = (vec![0u8; n], vec![0u8; n]);
+            orig.read_exact_at(&mut x, off).unwrap();
+            back.read_exact_at(&mut y, off).unwrap();
             assert_eq!(x, y, "GPT differs at offset {off}");
         }
         std::fs::remove_file(&work).unwrap();
