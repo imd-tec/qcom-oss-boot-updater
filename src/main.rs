@@ -383,8 +383,7 @@ fn check(o: &Opts) -> Res<i32> {
     for (e, s) in &drift {
         println!("imdt-boot: WARNING:   {}_{slot}: {s}", e.base);
     }
-    let flag = if o.pending { " --pending" } else { "" };
-    println!("imdt-boot: WARNING: run 'imdt-boot update{flag} --yes' or flash the release bundle with QDL");
+    println!("imdt-boot: WARNING: update the boot firmware to the latest release by flashing it with QDL");
     Ok(if o.warn_only { 0 } else { 1 })
 }
 
