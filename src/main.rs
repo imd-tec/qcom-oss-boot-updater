@@ -371,7 +371,12 @@ fn status(o: &Opts) -> Res<i32> {
 }
 
 fn check(o: &Opts) -> Res<i32> {
-    let m = Manifest::load(&deployment_root(o)?)?;
+    let root = deployment_root(o)?;
+    // A deployment without imdt-boot-firmware has nothing to check.
+    if !root.join(BOOT_DIR).join("manifest").exists() {
+        return Ok(0);
+    }
+    let m = Manifest::load(&root)?;
     let slot = booted_slot()?;
     let drift: Vec<_> = m.entries.iter().zip(compare(&m, slot)?).filter(|(_, s)| *s != "ok").collect();
     if drift.is_empty() {
